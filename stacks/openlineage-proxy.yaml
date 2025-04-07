@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for complimentary resources for lineage in Amazon DataZone'
+
+Parameters:
+
+  DomainId:
+    Type: String
+    Description: Id of the Amazon SageMaker Studio or Amazon DataZone domain
+  
+  DomainName:
+    Type: String
+    Description: Name of the Amazon SageMaker Studio or Amazon DataZone domain
+    AllowedPattern: ^[a-z0-9]+$
+
+  S3AssetsBucketName:
+    Type: String
+    Description: Name of the S3 bucket where the assets are stored
+
+Resources:
+
+  # SQS Resources
+  
+  LineageProxyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${DataZoneDomainName}-lineage-proxy-queue
+
+  # CloudWatch Logs Resources
+  
+  LineageProxyApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/api-gateway/${DataZoneDomainName}-lineage-proxy-api
+
+  LineageProxyLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${DataZoneDomainName}-lineage-proxy-lambda
+
+  # Lambda Resources
+  
+  LineageProxyLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${DataZoneDomainName}-lineage-proxy-lambda-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: 
+              - !GetAtt LineageProxyLambdaLogGroup.Arn
+          - Effect: Allow
+            Action:
+              - sqs:Get*
+              - sqs:List*
+              - sqs:ReceiveMessage
+              - sqs:SendMessage
+            Resource: 
+              - !GetAtt LineageProxyQueue.Arn
+          - Effect: Allow
+            Action:
+              - s3:Get*
+              - s3:List*
+              - s3:PutObject*
+              - s3:DeleteObject*
+            Resource: 
+              - !Sub arn:aws:s3:::${S3AssetsBucketName}
+              - !Sub arn:aws:s3:::${S3AssetsBucketName}/*
+          - Effect: Allow
+            Action:
+              - datazone:PostLineageEvent
+            Resource: 
+              - !Sub arn:aws:datazone:${AWS::Region}:${AWS::AccountId}:domain/${DataZoneDomainId}
+          - Effect: Allow
+            Action:
+              - redshift-serverless:GetWorkgroup
+            Resource: 
+              - !Sub arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/*
+          - Effect: Allow
+            Action:
+              - glue:GetTable
+            Resource: 
+              - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:*
+  
+  LineageProxyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${DataZoneDomainName}-lineage-proxy-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LineageProxyLambdaPolicy
+
+  LineageProxyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${DataZoneDomainName}-lineage-proxy-lambda
+      Handler: lineage_events_proxy.lambda_handler
+      Role: !GetAtt LineageProxyLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref S3AssetsBucketName
+        S3Key: lineage-proxy/code/lambda/lineage_events_proxy/lineage_events_proxy.zip
+      Runtime: python3.12
+      ReservedConcurrentExecutions: 1
+      Timeout: 20
+      MemorySize: 128
+      Environment:
+        Variables:
+          DOMAIN_ID: !Ref DataZoneDomainId
+
+  LineageProxyLambdaTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !GetAtt LineageProxyLambda.Arn
+      EventSourceArn: !GetAtt LineageProxyQueue.Arn
+      BatchSize: 20
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+  
+  # API Gateway Resources
+
+  LineageProxyApiPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${DataZoneDomainName}-lineage-proxy-api-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: 
+              - !GetAtt LineageProxyApiLogGroup.Arn
+          - Effect: Allow
+            Action:
+              - sqs:Get*
+              - sqs:List*
+              - sqs:SendMessage
+            Resource: 
+              - !GetAtt LineageProxyQueue.Arn
+  
+  LineageProxyApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${DataZoneDomainName}-lineage-proxy-api-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref LineageProxyApiPolicy
+  
+  LineageProxyApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${DataZoneDomainName}-lineage-proxy-api
+      ProtocolType: HTTP
+
+  LineageProxyApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref LineageProxyApi
+      IntegrationType: AWS_PROXY
+      IntegrationSubtype: SQS-SendMessage
+      PayloadFormatVersion: '1.0'
+      CredentialsArn: !GetAtt LineageProxyApiRole.Arn
+      RequestParameters:
+        QueueUrl: !Ref LineageProxyQueue
+        MessageBody: $request.body
+  
+  LineageProxyApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref LineageProxyApi
+      RouteKey: 'ANY /post-lineage-event'
+      Target: !Sub integrations/${LineageProxyApiIntegration}
+  
+  LineageProxyApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref LineageProxyApi
+      StageName: $default
+      AutoDeploy: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt LineageProxyApiLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength"}
+
+Outputs: 
+
+  LineageProxyApiUrl:
+    Description: URL of the HTTP API Gateway endpoint
+    Value: !Sub '${LineageProxyApi.ApiEndpoint}'
+
+  LineageProxyApiPath:
+    Description: Path of the HTTP API Gateway endpoint
+    Value: post-lineage-event
