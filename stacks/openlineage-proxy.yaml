@@ -55,6 +55,7 @@ Resources:
             Action:
               - sqs:Get*
               - sqs:List*
+              - sqs:DeleteMessage
               - sqs:ReceiveMessage
               - sqs:SendMessage
             Resource: 
